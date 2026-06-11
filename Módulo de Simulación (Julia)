@@ -1,12 +1,5 @@
 # ==============================================================================
-# MESA 2/3 — MODELO NACIONAL STOCK AND FLOW — versión final
-#
-# Mejoras aplicadas:
-#   - lambda_eff corregido: chatarrización solo activa post-2035 en QN
-#   - G4: anotación visual del quiebre normativo (no es tipping point de mercado)
-#   - G4: scatter del QN eliminado (el quiebre no es un tipping orgánico)
-#   - Nombres de archivos de salida unificados (prefijo MESA3_PRUEBA mantenido)
-#   - Comentarios internos limpiados y organizados por sección
+#  Dinámicas de largo plazo en la adopciónde vehículos eléctricos en Chile
 # ==============================================================================
 
 using DifferentialEquations

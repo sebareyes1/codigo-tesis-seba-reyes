@@ -1,0 +1,197 @@
+import sys
+import csv
+import numpy as np
+import torch
+from pathlib import Path
+from collections import defaultdict
+from transformers import AutoTokenizer, AutoModel
+
+# ------------------------------------------------------------------------------
+# 1. RUTAS PORTABLES
+# ------------------------------------------------------------------------------
+BASE_DIR = Path(__file__).parent
+RUTA_SALIDA = BASE_DIR / "input_pln_dinamico_local.csv"
+
+# ------------------------------------------------------------------------------
+# 2. INICIALIZAR MODELO LOCAL "TULIO" (DCC UChile)
+# ------------------------------------------------------------------------------
+print("--- Inicializando Inteligencia Artificial Local ---")
+print("Cargando modelo lingüístico de la Universidad de Chile (BETO)...")
+
+try:
+    nombre_modelo = "dccuchile/tulio-chilean-spanish-bert"
+    tokenizer = AutoTokenizer.from_pretrained(nombre_modelo)
+    modelo_local = AutoModel.from_pretrained(nombre_modelo)
+    modelo_local.eval()
+    print("✅ Modelo local 'Tulio' cargado y listo en tu procesador.")
+except Exception as e:
+    print(f"\n[ERROR] Falló la carga del modelo: {e}")
+    print("Asegúrate de tener instaladas las librerías: pip install transformers torch")
+    sys.exit(1)
+
+# ------------------------------------------------------------------------------
+# 3. FUNCIONES MATEMÁTICAS CORE
+# ------------------------------------------------------------------------------
+def similitud_coseno(vec_a, vec_b):
+    norma_a = np.linalg.norm(vec_a)
+    norma_b = np.linalg.norm(vec_b)
+    if norma_a == 0 or norma_b == 0: return 0.0
+    return float(np.dot(vec_a, vec_b) / (norma_a * norma_b))
+
+def obtener_embedding(texto):
+    # Transforma texto en un vector espacial usando el modelo local
+    inputs = tokenizer(texto, return_tensors="pt", truncation=True, max_length=512)
+    with torch.no_grad():
+        outputs = modelo_local(**inputs)
+    # Extraemos el vector promediado de las palabras
+    return outputs.last_hidden_state.mean(dim=1).squeeze().numpy()
+
+def similitud_a_score_ips(similitud_media):
+    # Auditoría
+    print(f"   -> [Auditoría] Similitud matemática cruda: {similitud_media:.4f}")
+    
+    # NUEVOS LÍMITES CALIBRADOS PARA TULIO
+    # Ajustados al rango real observado: 0.89 a 0.94
+    sim_min = 0.8950  # Piso: Cualquier cosa menor o igual a esto será un IPS bajo (1-3)
+    sim_max = 0.9350  # Techo: Cualquier cosa mayor o igual a esto será un IPS alto (9-10)
+    
+    # Expansión de Contraste
+    sim_clampeada = max(sim_min, min(sim_max, similitud_media))
+    score_raw = ((sim_clampeada - sim_min) / (sim_max - sim_min)) * 9.0 + 1.0
+    return max(1, min(10, round(score_raw)))
+
+def normalizar_pesos(pesos):
+    total = sum(pesos.values())
+    if total == 0:
+        return {k: round(1.0 / len(pesos), 4) for k in pesos}
+    return {k: round(v / total, 4) for k, v in pesos.items()}
+
+# ------------------------------------------------------------------------------
+# 4. ANCLAS SEMÁNTICAS ABSOLUTAS (e-AHP DIRECCIONAL)
+# ------------------------------------------------------------------------------
+ANCLAS_AHP = {
+    # --- BARRERAS (EL FRENO / POLARIDAD NEGATIVA) ---
+    "w_barrera_econom": "Alto costo de adquisición, precio de compra elevado, tecnología cara, inaccesible, falta de financiamiento, alto CAPEX.",
+    "w_barrera_social": "Ansiedad de autonomía, desconfianza ciudadana, miedo a quedarse botado, rechazo tecnológico, percepción de riesgo.",
+    "w_barrera_infra": "Falta de infraestructura de carga, escasez de electrolineras, no hay cargadores públicos, red insuficiente, estrés en la red.",
+
+    # --- IMPULSOS (EL ACELERADOR / POLARIDAD POSITIVA) ---
+    "w_impulso_econom": "Subsidios estatales, exenciones tributarias, rebaja de precios, depreciación acelerada, ahorro en OPEX, incentivos fiscales.",
+    "w_impulso_social": "Percepción pública positiva, adopción temprana, imagen tecnológica, confianza ciudadana, éxito ambiental.",
+    "w_impulso_infra": "Nuevas electrolineras, expansión de red de carga, cargadores rápidos Modo 3, inauguración de puntos de recarga SEC, cobertura total."
+}
+
+# El ancla de adopción general se mantiene igual (es el IPS global)
+ANCLA_ADOPCION = "Crecimiento de ventas de vehículos eléctricos, adopción acelerada, aumento de la flota eléctrica, récord de ventas, transición exitosa."
+# ------------------------------------------------------------------------------
+# 5. PRE-CALCULAR EMBEDDINGS DE LAS ANCLAS
+# ------------------------------------------------------------------------------
+print("\n📐 Pre-calculando vectores semánticos de las Anclas...")
+VECS_ANCLAS = {nombre: obtener_embedding(texto) for nombre, texto in ANCLAS_AHP.items()}
+VEC_ADOPCION = obtener_embedding(ANCLA_ADOPCION)
+
+# ------------------------------------------------------------------------------
+# 6. CORPUS DE NOTICIAS ESTRATÉGICO (2018 - 2035)
+# ------------------------------------------------------------------------------
+noticias_batch = [
+    ("2018-12-15",
+     "Llegan a Chile los primeros buses eléctricos para el transporte público de Santiago, marcando un hito inicial de electromovilidad urbana."),
+
+    ("2019-10-22",
+     "Chile fortalece su agenda de electromovilidad mediante instrumentos de política pública orientados a transporte sustentable e infraestructura de carga."),
+
+    ("2021-02-13",
+     "La Ley de Eficiencia Energética incorpora disposiciones relevantes para transporte eficiente y promueve condiciones favorables para tecnologías de cero emisiones."),
+
+    ("2021-12-01",
+     "La Estrategia Nacional de Electromovilidad establece metas de largo plazo para acelerar la incorporación de vehículos cero emisiones en Chile."),
+
+    ("2022-07-08",
+     "Usuarios de vehículos eléctricos reportan dificultades asociadas a la disponibilidad de cargadores rápidos en regiones y a la planificación de viajes interurbanos."),
+
+    ("2023-09-15",
+     "Programas de apoyo a la electromovilidad avanzan en regiones mediante incentivos para taxis eléctricos, infraestructura domiciliaria y difusión tecnológica."),
+
+    ("2024-12-30",
+     "El mercado chileno de vehículos cero y bajas emisiones muestra crecimiento, aunque los vehículos eléctricos enchufables aún se mantienen en una etapa de adopción temprana."),
+
+    ("2025-04-18",
+     "La expansión de la infraestructura de carga pública avanza en Chile, pero persisten brechas territoriales y desafíos de cobertura fuera de la Región Metropolitana."),
+
+    ("2025-12-30",
+     "Informes sectoriales muestran que Chile mantiene una fase de adopción temprana de vehículos eléctricos enchufables, con necesidad de fortalecer infraestructura, financiamiento y señales regulatorias.")
+]
+
+
+# ------------------------------------------------------------------------------
+# 7. MOTOR DE ANÁLISIS MULTIDIMENSIONAL
+# ------------------------------------------------------------------------------
+datos_procesados = []
+resumen_por_anio = defaultdict(lambda: {"scores_ips": [], "w_econom": [], "w_social": [], "w_infra": []})
+
+print("\n[INFO] Procesando el corpus de noticias (Calibración y Escenarios)...")
+print("-" * 75)
+
+for fecha, texto in noticias_batch:
+    vec_noticia = obtener_embedding(texto)
+    
+    # 7.1 Calcular IPS Global
+    sim_adopcion = similitud_coseno(vec_noticia, VEC_ADOPCION)
+    score_ips = similitud_a_score_ips(sim_adopcion)
+    
+    # 7.2 Calcular Pesos e-AHP
+    sims_ahp = {nombre: max(0.0, similitud_coseno(vec_noticia, vec)) for nombre, vec in VECS_ANCLAS.items()}
+    pesos = normalizar_pesos(sims_ahp)
+    
+    # --- CÁLCULO DE POLARIDAD NETA (IMPULSO - BARRERA) ---
+    neto_econom = pesos["w_impulso_econom"] - pesos["w_barrera_econom"]
+    neto_social = pesos["w_impulso_social"] - pesos["w_barrera_social"]
+    neto_infra  = pesos["w_impulso_infra"] - pesos["w_barrera_infra"]
+    
+    print(f"[{fecha}] IPS: {score_ips}/10 | Eco Neto={neto_econom:.3f}, Soc Neto={neto_social:.3f}, Inf Neto={neto_infra:.3f}")
+    
+    # 7.3 Guardar en memoria los valores NETOS
+    datos_procesados.append([fecha, texto, score_ips, "Análisis NLP Local", neto_econom, neto_social, neto_infra])
+    
+    anio = int(fecha[:4])
+    resumen_por_anio[anio]["scores_ips"].append(score_ips)
+    resumen_por_anio[anio]["w_econom"].append(neto_econom)
+    resumen_por_anio[anio]["w_social"].append(neto_social)
+    resumen_por_anio[anio]["w_infra"].append(neto_infra)
+
+# ------------------------------------------------------------------------------
+# 8. EXPORTAR CSV PARA JULIA (Con soporte UTF-8)
+# ------------------------------------------------------------------------------
+try:
+    with open(RUTA_SALIDA, mode='w', newline='', encoding='utf-8-sig') as file:
+        writer = csv.writer(file)
+        
+        # --- TABLA A: Datos por noticia ---
+        writer.writerow(["Fecha", "Noticia", "Score_IPS", "Justificacion", "w_econom", "w_social", "w_infra"])
+        writer.writerows(datos_procesados)
+        
+        writer.writerow([])
+        writer.writerow(["#RESUMEN_ANUAL"])
+        
+        # --- TABLA B: Resumen para Julia ---
+        writer.writerow(["Anio", "IPS_Score_Promedio", "IPS_Normalizado", "w_econom_anual", "w_social_anual", "w_infra_anual", "N_Noticias"])
+        
+        for anio, datos in sorted(resumen_por_anio.items()):
+            prom = lambda lst: sum(lst) / len(lst) if lst else 0.0
+            ips_prom = prom(datos["scores_ips"])
+            
+            writer.writerow([
+                anio,
+                round(ips_prom, 2),
+                round((ips_prom - 5.0) / 5.0, 4),
+                round(prom(datos["w_econom"]), 4),
+                round(prom(datos["w_social"]), 4),
+                round(prom(datos["w_infra"]), 4),
+                len(datos["scores_ips"])
+            ])
+            
+    print("-" * 75)
+    print(f"✅ [SUCCESS] Matriz matemática generada. CSV guardado en:\n{RUTA_SALIDA}")
+except OSError as e:
+    print(f"[ERROR] No se pudo guardar el CSV: {e}")
+    print("Asegúrate de que el archivo Excel NO esté abierto en tu computador.")

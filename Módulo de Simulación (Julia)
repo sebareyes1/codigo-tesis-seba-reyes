@@ -1,5 +1,13 @@
 # ==============================================================================
-#  Dinámicas de largo plazo en la adopciónde vehículos eléctricos en Chile
+# DEFENSA  — DINAMICAS DE LARGO PLAZO PARA LA ADOPCION DE VEHICULOS ELECTRICOS EN CHILE
+#
+# Escenarios: BAU, Impulso Económico, Estrategia Integral
+#
+# Arquitectura general:
+#   - Fase 1: modelo de difusión Bass-Struben sobre cuota de ventas s(t),
+#             parque acumulado N(t) e infraestructura C(t)
+#   - Fase 2: cálculo de impacto eléctrico y ambiental a partir de N(t)
+#   - PLN: IPS y señales semánticas dinámicas leídas desde CSV generado en Python
 # ==============================================================================
 
 using DifferentialEquations
@@ -9,19 +17,41 @@ using Plots
 # 1. PARÁMETROS GLOBALES
 # ==============================================================================
 
+# Flujo anual del mercado automotor chileno de livianos y medianos (ANAC 2025-2026)
 const VENTAS_ANUALES = 310_000.0
-const S0_REAL        =      0.032
-const N0_REAL        = 10_000.0
-const C0_REAL        =  2_088.0
-const P0             =     0.0005
-const Q0             =     0.180
-const W_SOC          =     0.2884
-const W_ECO          =     0.2040
-const W_INFRA        =     0.2615
 
+# Condición inicial de cuota de ventas BEV+PHEV (3,2% según ANAC 2026)
+const S0_REAL = 0.032
+
+# Condición inicial del parque acumulado BEV+PHEV circulante (Ministerio de Energía)
+const N0_REAL = 10_000.0
+
+# Condición inicial de infraestructura de carga pública (SEC / EcoCarga 2025)
+const C0_REAL = 2_088.0
+
+# Coeficiente de innovación base del modelo Bass:
+# captura la adopción espontánea por factores externos (publicidad, política, precio)
+const P0 = 0.0005
+
+# Coeficiente de imitación base del modelo Bass:
+# captura el contagio social entre adoptantes y no adoptantes
+const Q0 = 0.180
+
+# Pesos base del modelo e-AHP dinámico, obtenidos desde el módulo Python/Tulio:
+#   W_SOC  : peso de la dimensión social (norma, percepción de pares)
+#   W_ECO  : peso de la dimensión económica (costo total de propiedad, subsidios)
+#   W_INFRA: peso de la dimensión infraestructural (disponibilidad de carga)
+const W_SOC   = 0.2884
+const W_ECO   = 0.2040
+const W_INFRA = 0.2615
+
+# Vector de condiciones iniciales del sistema ODE: [s0, N0, C0]
 const u0    = [S0_REAL, N0_REAL, C0_REAL]
+
+# Horizonte temporal de simulación: 2025 a 2050
 const tspan = (2025.0, 2050.0)
 
+# Constantes de formato para los gráficos
 const AÑOS_IMPACTO = ["2030", "2035"]
 const X_TICKS      = [1, 2]
 const FONT_TITLE   = 12
@@ -32,19 +62,34 @@ const NOTA_PIE     = "Elaboración propia, 2026."
 
 # ==============================================================================
 # 2. CARGA DEL CSV PLN
+#
+# El módulo Python genera un CSV con dos secciones separadas por la marca
+# "#RESUMEN_ANUAL". Esta sección contiene una fila por año con:
+#   - IPS_Normalizado  : índice de percepción social agregado en [-1, 1]
+#   - w_econom_anual   : polaridad neta de la dimensión económica (impulso - barrera)
+#   - w_social_anual   : polaridad neta de la dimensión social
+#   - w_infra_anual    : polaridad neta de la dimensión infraestructural
+#
+# Los valores se interpolan linealmente entre años y se mantienen constantes
+# fuera del rango observado (extrapolación flat).
 # ==============================================================================
 
+# Estructura que almacena las series temporales anuales del módulo PLN
 struct SeriePLN
-    anios::Vector{Float64}
-    ips::Vector{Float64}
-    r_econom::Vector{Float64}
-    r_social::Vector{Float64}
-    r_infra::Vector{Float64}
+    anios::Vector{Float64}    # años disponibles (ordenados)
+    ips::Vector{Float64}      # IPS normalizado por año
+    r_econom::Vector{Float64} # polaridad neta dimensión económica
+    r_social::Vector{Float64} # polaridad neta dimensión social
+    r_infra::Vector{Float64}  # polaridad neta dimensión infraestructural
 end
 
-const NOMBRE_ARCHIVO_PLN  = "input_pln_dinamico_local.csv"
-const RUTA_PRINCIPAL_PLN  = raw"C:\Users\sebar\Desktop\PYTHON\input_pln_dinamico_local.csv"
+const NOMBRE_ARCHIVO_PLN = "input_pln_dinamico_local.csv"
+const RUTA_PRINCIPAL_PLN = raw"C:\Users\sebar\Desktop\PYTHON\input_pln_dinamico_local.csv"
 
+# Busca el CSV en tres rutas en orden de prioridad:
+# 1. Ruta absoluta configurada (Windows)
+# 2. Carpeta del script Julia
+# 3. Directorio de trabajo actual
 function resolver_ruta_pln(ruta_principal::String, nombre::String)::String
     for ruta in [ruta_principal, joinpath(@__DIR__, nombre), joinpath(pwd(), nombre)]
         isfile(ruta) && return abspath(ruta)
@@ -54,14 +99,21 @@ function resolver_ruta_pln(ruta_principal::String, nombre::String)::String
                 joinpath(@__DIR__, nombre), joinpath(pwd(), nombre)]], "\n"))
 end
 
+# Lee el CSV, localiza la marca #RESUMEN_ANUAL y extrae las columnas requeridas.
+# Verifica que existan todas las columnas antes de parsear.
+# Retorna un SeriePLN con los datos ordenados cronológicamente.
 function cargar_resumen_pln(ruta::String)::SeriePLN
+    # Eliminar BOM UTF-8 si existe (frecuente en archivos generados en Windows)
     lineas = [replace(l, '\ufeff' => "") for l in readlines(ruta)]
+
     idx = findfirst(l -> strip(l) == "#RESUMEN_ANUAL", lineas)
     isnothing(idx) && error("El CSV no contiene la marca #RESUMEN_ANUAL.")
 
     enc = strip.(split(strip(lineas[idx + 1]), ','))
     cols = ["Anio","IPS_Score_Promedio","IPS_Normalizado",
             "w_econom_anual","w_social_anual","w_infra_anual","N_Noticias"]
+
+    # Verificar que todas las columnas requeridas estén presentes
     falt = setdiff(cols, enc)
     isempty(falt) || error("Faltan columnas: $(join(falt, ", "))")
     pos = Dict(c => findfirst(==(c), enc) for c in cols)
@@ -78,7 +130,7 @@ function cargar_resumen_pln(ruta::String)::SeriePLN
             push!(rs,    parse(Float64, cel[pos["w_social_anual"]]))
             push!(ri,    parse(Float64, cel[pos["w_infra_anual"]]))
         catch err
-            @warn "Fila omitida" l exception=(err, catch_backtrace())
+            @warn "Fila omitida por formato inválido" l exception=(err, catch_backtrace())
         end
     end
     isempty(anios) && error("No hay filas anuales válidas en $ruta.")
@@ -89,20 +141,29 @@ function cargar_resumen_pln(ruta::String)::SeriePLN
     return SeriePLN(anios[ord], ips[ord], re[ord], rs[ord], ri[ord])
 end
 
+# Interpolación lineal entre años observados con retención del último valor
+# fuera del rango (flat extrapolation).
+# Permite que el solver ODE evalúe el IPS en cualquier t continuo.
 function interpolar_lineal_hold(t::Real, xs::Vector{Float64}, ys::Vector{Float64})
     tt = Float64(t)
-    tt <= xs[1]   && return ys[1]
-    tt >= xs[end] && return ys[end]
+    tt <= xs[1]   && return ys[1]    # antes del primer año: mantener primer valor
+    tt >= xs[end] && return ys[end]  # después del último año: mantener último valor
     i = searchsortedlast(xs, tt)
+    # Interpolación lineal entre xs[i] y xs[i+1]
     return ys[i] + (ys[i+1] - ys[i]) * (tt - xs[i]) / (xs[i+1] - xs[i])
 end
 
+# Carga efectiva del CSV y construcción de las funciones de acceso dinámico
 const RUTA_PLN  = resolver_ruta_pln(RUTA_PRINCIPAL_PLN, NOMBRE_ARCHIVO_PLN)
 const SERIE_PLN = cargar_resumen_pln(RUTA_PLN)
 
+# Retorna el IPS normalizado interpolado en el tiempo t
 get_dynamic_ips(t::Real) =
     interpolar_lineal_hold(t, SERIE_PLN.anios, SERIE_PLN.ips)
 
+# Retorna la terna de señales semánticas (econom, social, infra) en el tiempo t.
+# Cada señal es una polaridad neta: valor positivo = clima favorable,
+# valor negativo = clima adverso para la adopción en esa dimensión.
 function get_dynamic_semantic_signals(t::Real)
     (econom = interpolar_lineal_hold(t, SERIE_PLN.anios, SERIE_PLN.r_econom),
      social = interpolar_lineal_hold(t, SERIE_PLN.anios, SERIE_PLN.r_social),
@@ -121,6 +182,20 @@ end
 
 # ==============================================================================
 # 3. STRUCT DE ESCENARIO
+#
+# Cada escenario define los multiplicadores de política e infraestructura
+# y el flujo anual de inversión pública en cargadores (carg/año).
+#
+# Campos:
+#   F_pol            : multiplicador del coeficiente de innovación p(t)
+#                      representa la intensidad relativa de políticas de apoyo
+#   F_infra          : multiplicador del factor infraestructura en q(t)
+#                      representa el ritmo de expansión de la red de carga
+#   F_IPS            : escala la sensibilidad del modelo al IPS
+#   B_eAHP           : factor de barreras percibidas [0,1]
+#                      1.0 = fricción máxima, 0.75 = 25% de barreras removidas
+#   inversion_publica: flujo físico de cargadores instalados por el Estado [carg/año]
+#                      entra directamente en dC/dt (NO es un multiplicador)
 # ==============================================================================
 
 struct EscenarioMesa2
@@ -131,84 +206,153 @@ struct EscenarioMesa2
     F_IPS::Float64
     B_eAHP::Float64
     inversion_publica::Float64
-    lambda::Float64
-    quiebre_normativo::Bool
 end
 
+# Tabla de escenarios:
+# ┌──────────────────────┬───────┬────────┬───────┬────────┬──────────────────┐
+# │ Escenario            │ F_pol │ F_infra│ F_IPS │ B_eAHP │ Inv. pública     │
+# ├──────────────────────┼───────┼────────┼───────┼────────┼──────────────────┤
+# │ BAU                  │ 1.00  │ 1.00   │ 1.00  │ 1.00   │ 20 carg/año      │
+# │ Impulso Económico    │ 1.20  │ 1.05   │ 1.15  │ 0.90   │ 100 carg/año     │
+# │ Estrategia Integral  │ 1.30  │ 1.30   │ 1.25  │ 0.75   │ 250 carg/año     │
+# └──────────────────────┴───────┴────────┴───────┴────────┴──────────────────┘
 const escenarios = [
-    EscenarioMesa2("BAU",                    :BAU,     1.00,1.00,1.00,1.00, 20.0, 0.0,   false),
-    EscenarioMesa2("Impulso Económico",      :IMPULSO, 1.20,1.05,1.15,0.90,100.0, 0.0,   false),
-    EscenarioMesa2("Estrategia Integral",    :INTEGRAL,1.30,1.30,1.25,0.75,250.0, 0.0,   false),
-    EscenarioMesa2("Quiebre Normativo 2035", :QUIEBRE, 1.30,1.30,1.25,0.75,250.0, 0.060, true),
+    EscenarioMesa2("BAU",                 :BAU,     1.00,1.00,1.00,1.00, 20.0),
+    EscenarioMesa2("Impulso Económico",   :IMPULSO, 1.20,1.05,1.15,0.90,100.0),
+    EscenarioMesa2("Estrategia Integral", :INTEGRAL,1.30,1.30,1.25,0.75,250.0),
 ]
 
 # ==============================================================================
 # 4. MODELO STOCK AND FLOW
+#
+# Sistema de tres ecuaciones diferenciales ordinarias:
+#
+#   u[1] = s(t) : cuota de ventas BEV+PHEV en el mercado [0,1]
+#   u[2] = N(t) : parque acumulado BEV+PHEV circulante [unidades]
+#   u[3] = C(t) : infraestructura de carga pública [cargadores]
+#
+# Ecuación 1 — Bass sobre cuota de mercado:
+#   ds/dt = [p(t) + q(t)·s] · (1 - s)
+#   donde (1 - s) es la fracción aún no adoptada del mercado.
+#   p(t): tasa de innovación efectiva (modulada por política, e-AHP y PLN)
+#   q(t): tasa de imitación efectiva (modulada por infraestructura, IPS y PLN)
+#
+# Ecuación 2 — Stock and Flow del parque:
+#   dN/dt = s(t) · VENTAS_ANUALES
+#   flujo de entrada = ventas anuales × cuota enchufable
+#   λ = 0 (parque joven, chatarrización despreciable en 2025-2035)
+#
+# Ecuación 3 — Dinámica de infraestructura:
+#   dC/dt = inversion_publica + 0.005 · N(t)
+#   el segundo término modela la instalación privada inducida por el parque
 # ==============================================================================
 
 function modelo_stockflow!(du, u, esc::EscenarioMesa2, t)
+
+    # Límites físicos: s ∈ [0,1], N ≥ 0, C ≥ 0
     s = clamp(u[1], 0.0, 1.0)
     N = max(u[2], 0.0)
     C = max(u[3], 0.0)
 
-    # Tramo quiebre normativo: t >= 2035
-    # lambda_eff: chatarrización solo activa post-2035 en QN
-    # → antes de 2035 el QN se comporta idéntico a Estrategia Integral
-    if esc.quiebre_normativo && t >= 2035.0
-        du[1] = 0.0
-        du[2] = VENTAS_ANUALES - esc.lambda * N
-        du[3] = esc.inversion_publica + 0.005 * N
-        return
-    end
+    # ------------------------------------------------------------------
+    # Señales dinámicas del módulo PLN
+    # ------------------------------------------------------------------
 
-    # Tramo normal: Bass con fricción dinámica
-    ips_val = get_dynamic_ips(t)
-    sig     = get_dynamic_semantic_signals(t)
+    ips_val = get_dynamic_ips(t)      # IPS normalizado en el año t
+    sig     = get_dynamic_semantic_signals(t)  # señales por dimensión
 
-    mult_ips        = clamp(1.0 + 0.3 * ips_val * esc.F_IPS, 0.50, 1.50)
-    mult_infra_fis  = 1.0 + 0.5 * ((C / 5_000.0) / (1.0 + C / 5_000.0)) * esc.F_infra
-    mult_barrera    = 1.0 / max(esc.B_eAHP, 0.01)
+    # Multiplicador IPS sobre q(t):
+    # un IPS positivo amplifica el efecto de imitación social.
+    # Rango [0.50, 1.50] para evitar multiplicadores no físicos.
+    mult_ips = clamp(1.0 + 0.3 * ips_val * esc.F_IPS, 0.50, 1.50)
 
+    # ------------------------------------------------------------------
+    # Factor de infraestructura física
+    # ------------------------------------------------------------------
+
+    # mult_infra_fis: función saturante de C(t) respecto a un nivel de
+    # referencia C_ref = 5.000 cargadores.
+    # Cuando C → 0: mult_infra_fis → 1 (sin efecto reforzador)
+    # Cuando C → ∞: mult_infra_fis → 1 + 0.5·F_infra (efecto máximo)
+    # Modela la reducción de ansiedad de autonomía a medida que crece la red.
+    mult_infra_fis = 1.0 + 0.5 * ((C / 5_000.0) / (1.0 + C / 5_000.0)) * esc.F_infra
+
+    # ------------------------------------------------------------------
+    # Factor de barreras percibidas (e-AHP)
+    # ------------------------------------------------------------------
+
+    # mult_barrera = 1 / B_eAHP:
+    # B_eAHP = 1.0 → mult_barrera = 1.0 → fricción máxima (BAU)
+    # B_eAHP = 0.75 → mult_barrera ≈ 1.33 → barreras reducidas en 25%
+    mult_barrera = 1.0 / max(esc.B_eAHP, 0.01)
+
+    # ------------------------------------------------------------------
+    # Pesos e-AHP dinámicos modulados por señales PLN
+    # ------------------------------------------------------------------
+
+    # Las señales PLN w_*_anual son polaridades netas (impulso - barrera).
+    # Modulan los pesos base del e-AHP:
+    #   señal positiva → peso efectivo aumenta → mayor presión hacia adopción
+    #   señal negativa → peso efectivo disminuye → mayor resistencia
+    # Clamp [0,1] para mantener los pesos como fracciones positivas.
     w_eco_dyn   = clamp(W_ECO   * (1.0 + sig.econom), 0.0, 1.0)
     w_soc_dyn   = clamp(W_SOC   * (1.0 + sig.social), 0.0, 1.0)
     w_infra_dyn = clamp(W_INFRA * (1.0 + sig.infra),  0.0, 1.0)
 
-    p_eff = P0 * esc.F_pol * esc.F_infra * mult_barrera * (1.0 + w_eco_dyn + w_infra_dyn)
-    q_eff = Q0 * mult_ips * mult_infra_fis * mult_barrera * (1.0 + w_soc_dyn)
+    # ------------------------------------------------------------------
+    # Coeficientes efectivos Bass
+    # ------------------------------------------------------------------
 
+    # p_eff: tasa de innovación efectiva
+    # Modulada por política (F_pol), infraestructura (F_infra),
+    # barreras (mult_barrera) y señales económica e infraestructural del PLN.
+    p_eff = P0 * esc.F_pol * esc.F_infra * mult_barrera *
+            (1.0 + w_eco_dyn + w_infra_dyn)
+
+    # q_eff: tasa de imitación efectiva
+    # Modulada por IPS (mult_ips), infraestructura física (mult_infra_fis),
+    # barreras (mult_barrera) y señal social del PLN.
+    q_eff = Q0 * mult_ips * mult_infra_fis * mult_barrera *
+            (1.0 + w_soc_dyn)
+
+    # ------------------------------------------------------------------
+    # Ecuaciones diferenciales
+    # ------------------------------------------------------------------
+
+    # Ec. 1: Bass sobre cuota de mercado
+    # ds/dt = [p(t) + q(t)·s] · (1 - s)
+    # El factor (1-s) garantiza que la cuota no supere el 100%.
     du[1] = (p_eff + q_eff * s) * (1.0 - s)
 
-    lambda_eff = (esc.quiebre_normativo && t >= 2035.0) ? esc.lambda : 0.0
-    du[2] = s * VENTAS_ANUALES - lambda_eff * N
+    # Ec. 2: Stock and Flow del parque acumulado
+    # dN/dt = s(t) · VENTAS_ANUALES
+    # Cada año ingresan al parque las unidades vendidas ese año.
+    du[2] = s * VENTAS_ANUALES
+
+    # Ec. 3: Dinámica de infraestructura de carga
+    # dC/dt = inversión pública fija [carg/año] + inversión privada inducida
+    # El término 0.005·N modela que por cada 200 VE en circulación
+    # se instala aproximadamente 1 cargador privado.
     du[3] = esc.inversion_publica + 0.005 * N
 end
 
 # ==============================================================================
-# 4.1 CALLBACK — QUIEBRE NORMATIVO EN t = 2035
-# Fija u[1] = 1.0 exactamente en 2035 solo para el escenario QN
-# ==============================================================================
-
-cb_quiebre = ContinuousCallback(
-    (u, t, integrator) -> t - 2035.0,
-    integrator -> begin
-        esc = integrator.p
-        esc.quiebre_normativo && (integrator.u[1] = 1.0)
-    end
-)
-
-# ==============================================================================
 # 5. SIMULACIÓN
+#
+# Se resuelve el sistema ODE para cada escenario usando el solver Tsit5
+# (Runge-Kutta de orden 5 con control de paso adaptativo).
+# saveat=1.0 guarda el estado del sistema en cada año entero.
 # ==============================================================================
 
 println("\n" * "=" ^ 60)
-println("MESA 2/3 — MODELO NACIONAL STOCK AND FLOW INTEGRADO")
+println("MESA 2/3 — MODELO NACIONAL STOCK AND FLOW")
 println("Escala: Chile | Horizonte: 2025–2050")
 println("=" ^ 60)
 
 soluciones = Dict{String, Any}()
 for esc in escenarios
     prob = ODEProblem(modelo_stockflow!, u0, tspan, esc)
-    sol  = solve(prob, Tsit5(), saveat=1.0, callback=cb_quiebre)
+    sol  = solve(prob, Tsit5(), saveat=1.0)
     soluciones[esc.nombre] = sol
     println("  ✓ $(esc.nombre)")
 end
@@ -218,16 +362,22 @@ println("Simulación finalizada.\n")
 # 6. FUNCIONES DE EXTRACCIÓN
 # ==============================================================================
 
+# Retorna la terna (s, N, C) para el año calendario indicado.
+# Busca el índice exacto en sol.t usando redondeo al entero más cercano.
 function obtener_estado_en_anio(sol, anio)
     idx = findfirst(t -> round(Int, t) == anio, sol.t)
     isnothing(idx) && error("Año no encontrado: $anio")
     return sol.u[idx][1], sol.u[idx][2], sol.u[idx][3]
 end
 
+# Retorna el año y la cuota s(t) del tipping point de la curva de adopción.
+# El tipping point es el año de mayor aceleración de s(t), definido como
+# el máximo de la derivada discreta ds/dt = diff(s).
+# Es el punto de inflexión de la curva sigmoidal de Bass.
 function obtener_tipping_point_cuota(sol)
     cuotas = [clamp(u[1], 0.0, 1.0) for u in sol.u]
-    tasas  = diff(cuotas)
-    idx    = argmax(tasas)
+    tasas  = diff(cuotas)     # derivada discreta anual de s(t)
+    idx    = argmax(tasas)    # año de mayor aceleración
     return sol.t[idx + 1], tasas[idx], cuotas[idx + 1]
 end
 
@@ -268,32 +418,33 @@ println("=" ^ 90)
 sol_BAU = soluciones["BAU"]
 sol_IMP = soluciones["Impulso Económico"]
 sol_INT = soluciones["Estrategia Integral"]
-sol_QN  = soluciones["Quiebre Normativo 2035"]
 
+# Parque acumulado N(t) para cada escenario
 N_BAU = [u[2] for u in sol_BAU.u]
 N_IMP = [u[2] for u in sol_IMP.u]
 N_INT = [u[2] for u in sol_INT.u]
-N_QN  = [u[2] for u in sol_QN.u]
 
+# Cuota de ventas s(t) en porcentaje [%]
 s_BAU = [clamp(u[1],0.0,1.0)*100 for u in sol_BAU.u]
 s_IMP = [clamp(u[1],0.0,1.0)*100 for u in sol_IMP.u]
 s_INT = [clamp(u[1],0.0,1.0)*100 for u in sol_INT.u]
-s_QN  = [clamp(u[1],0.0,1.0)*100 for u in sol_QN.u]
 
+# Ventas anuales BEV+PHEV = s(t) × VENTAS_ANUALES [vehículos/año]
 ventas_BAU = s_BAU ./ 100 .* VENTAS_ANUALES
 ventas_IMP = s_IMP ./ 100 .* VENTAS_ANUALES
 ventas_INT = s_INT ./ 100 .* VENTAS_ANUALES
-ventas_QN  = s_QN  ./ 100 .* VENTAS_ANUALES
 
+# Tipping points de cada escenario
 anio_tp_BAU, _, s_tp_BAU = obtener_tipping_point_cuota(sol_BAU)
 anio_tp_IMP, _, s_tp_IMP = obtener_tipping_point_cuota(sol_IMP)
 anio_tp_INT, _, s_tp_INT = obtener_tipping_point_cuota(sol_INT)
 
+# Valores de cuota en el año normativo de referencia (2035)
 s_bau_35 = obtener_estado_en_anio(sol_BAU, 2035)[1] * 100
 s_imp_35 = obtener_estado_en_anio(sol_IMP, 2035)[1] * 100
 s_int_35 = obtener_estado_en_anio(sol_INT, 2035)[1] * 100
-s_qn_35  = obtener_estado_en_anio(sol_QN,  2035)[1] * 100
 
+# Parque y cuota del escenario Integral en hitos clave (usados en Fase 2)
 _, N2030_INT, _ = obtener_estado_en_anio(sol_INT, 2030)
 _, N2035_INT, _ = obtener_estado_en_anio(sol_INT, 2035)
 s2030_INT = obtener_estado_en_anio(sol_INT, 2030)[1]
@@ -319,16 +470,17 @@ p1 = plot(
 plot!(p1, sol_BAU.t, N_BAU, label="BAU",               lw=3, color=:gray)
 plot!(p1, sol_IMP.t, N_IMP, label="Impulso Económico", lw=3, color=:orange)
 plot!(p1, sol_INT.t, N_INT, label="Estrategia Integral",lw=3, color=:green)
-plot!(p1, sol_QN.t,  N_QN,  label="Quiebre Normativo 2035",
-    lw=3, color=:blue, linestyle=:dash)
 vline!(p1, [2035.0], label="Meta: 100% ventas cero emisiones (ENE 2021)",
     linestyle=:dash, color=:black)
 annotate!(p1, 2051, -maximum(N_INT)*0.06, text(NOTA_PIE,7,:right,:gray))
-savefig(p1, "MESA3_PRUEBA_g1_parque_acumulado.png")
+savefig(p1, "DEFENSA_g1_parque_acumulado.png")
 println("✓ G1 — Parque acumulado")
 
 # ==============================================================================
 # GRÁFICO 2 — CUOTA DE VENTAS s(t)
+# Muestra la variable que Bass modela directamente.
+# La brecha entre la curva del Integral y la meta del 100% es un resultado
+# honesto: el modelo no está calibrado para forzar el cumplimiento normativo.
 # ==============================================================================
 
 p2 = plot(
@@ -341,21 +493,20 @@ p2 = plot(
 plot!(p2, sol_BAU.t, s_BAU, label="BAU",               lw=3, color=:gray)
 plot!(p2, sol_IMP.t, s_IMP, label="Impulso Económico", lw=3, color=:orange)
 plot!(p2, sol_INT.t, s_INT, label="Estrategia Integral",lw=3, color=:green)
-plot!(p2, sol_QN.t,  s_QN,  label="Quiebre Normativo 2035",
-    lw=3, color=:blue, linestyle=:dash)
 hline!(p2, [100.0], label="Meta: 100% ventas de vehículos cero emisiones (ENE 2021)",
     linestyle=:dot, color=:black, lw=1.5)
 vline!(p2, [2035.0], label="Año de referencia", linestyle=:dash, color=:black)
-annotate!(p2, 2034.7, s_qn_35+2,  text("$(round(s_qn_35,digits=1))%",  8,:right,:blue))
 annotate!(p2, 2035.4, s_int_35+2, text("$(round(s_int_35,digits=1))%", 8,:left,:darkgreen))
 annotate!(p2, 2035.4, s_imp_35+2, text("$(round(s_imp_35,digits=1))%", 8,:left,:darkorange))
 annotate!(p2, 2035.4, s_bau_35+2, text("$(round(s_bau_35,digits=1))%", 8,:left,:gray))
 annotate!(p2, 2051, -9, text(NOTA_PIE,7,:right,:gray))
-savefig(p2, "MESA3_PRUEBA_g2_cuota_ventas.png")
+savefig(p2, "DEFENSA_g2_cuota_ventas.png")
 println("✓ G2 — Cuota de ventas s(t)")
 
 # ==============================================================================
 # GRÁFICO 3 — VENTAS ANUALES BEV + PHEV
+# Muestra el flujo anual de entrada al parque: Ventas(t) = s(t) × 310.000.
+# La línea punteada es el techo del mercado total (310.000 veh/año).
 # ==============================================================================
 
 p3 = plot(
@@ -369,19 +520,19 @@ p3 = plot(
 plot!(p3, sol_BAU.t, ventas_BAU, label="BAU",               lw=3, color=:gray)
 plot!(p3, sol_IMP.t, ventas_IMP, label="Impulso Económico", lw=3, color=:orange)
 plot!(p3, sol_INT.t, ventas_INT, label="Estrategia Integral",lw=3, color=:green)
-plot!(p3, sol_QN.t,  ventas_QN,  label="Quiebre Normativo 2035",
-    lw=3, color=:blue, linestyle=:dash)
 hline!(p3, [VENTAS_ANUALES], label="Total ventas livianos/medianos (310.000/año)",
     linestyle=:dot, color=:black, lw=1.5)
 vline!(p3, [2035.0], label="Meta: 100% ventas cero emisiones 2035",
     linestyle=:dash, color=:black)
 annotate!(p3, 2051, -VENTAS_ANUALES*0.06, text(NOTA_PIE,7,:right,:gray))
-savefig(p3, "MESA3_PRUEBA_g3_ventas_anuales_bev_phev.png")
+savefig(p3, "DEFENSA_g3_ventas_anuales_bev_phev.png")
 println("✓ G3 — Ventas anuales BEV+PHEV")
 
 # ==============================================================================
 # GRÁFICO 4 — TIPPING POINTS SOBRE s(t)
-# El QN no tiene tipping point de mercado: se marca con anotación normativa
+# Marca el año de mayor aceleración de la cuota (punto de inflexión).
+# Es el instante en que el efecto de imitación domina sobre la fricción.
+# Los diamantes indican el año y la cuota en ese punto para cada escenario.
 # ==============================================================================
 
 p4 = plot(
@@ -394,9 +545,8 @@ p4 = plot(
 plot!(p4, sol_BAU.t, s_BAU, label="BAU",               lw=3, color=:gray)
 plot!(p4, sol_IMP.t, s_IMP, label="Impulso Económico", lw=3, color=:orange)
 plot!(p4, sol_INT.t, s_INT, label="Estrategia Integral",lw=3, color=:green)
-plot!(p4, sol_QN.t,  s_QN,  label="Quiebre Normativo 2035",
-    lw=3, color=:blue, linestyle=:dash)
 
+# Diamantes en el punto de inflexión de cada curva
 scatter!(p4, [anio_tp_BAU], [s_tp_BAU*100],
     label="Tipping BAU",     marker=:diamond, markersize=8, color=:black)
 scatter!(p4, [anio_tp_IMP], [s_tp_IMP*100],
@@ -404,6 +554,7 @@ scatter!(p4, [anio_tp_IMP], [s_tp_IMP*100],
 scatter!(p4, [anio_tp_INT], [s_tp_INT*100],
     label="Tipping Integral",marker=:diamond, markersize=8, color=:darkgreen)
 
+# Anotaciones con año y cuota en cada tipping point
 for (anio, s_val, col) in [
     (anio_tp_BAU, s_tp_BAU, :black),
     (anio_tp_IMP, s_tp_IMP, :darkorange),
@@ -413,16 +564,12 @@ for (anio, s_val, col) in [
         text("$(round(Int,anio))\n$(round(s_val*100,digits=1))%", 8,:left,col))
 end
 
-# Anotación normativa del quiebre: no es un tipping de mercado
-annotate!(p4, 2035.4, 103,
-    text("Quiebre normativo\ns(t) = 100%", 8, :left, :blue))
-
 hline!(p4, [100.0], label="Meta: 100% ventas cero emisiones",
     linestyle=:dot, color=:black, lw=1.5)
 vline!(p4, [2035.0], label="Referencia normativa 2035",
     linestyle=:dash, color=:black)
 annotate!(p4, 2051, -9, text(NOTA_PIE,7,:right,:gray))
-savefig(p4, "MESA3_PRUEBA_g4_tipping_points_cuota.png")
+savefig(p4, "DEFENSA_g4_tipping_points_cuota.png")
 println("✓ G4 — Tipping points s(t)")
 
 println("\n" * "=" ^ 60)
@@ -431,6 +578,21 @@ println("=" ^ 60)
 
 # ==============================================================================
 # 9. FASE 2 — IMPACTO ELÉCTRICO Y AMBIENTAL NACIONAL
+#
+# Traduce las trayectorias de N(t) del escenario Estrategia Integral
+# en indicadores de ingeniería eléctrica y ambiental.
+#
+# Supuestos técnicos con sus fuentes:
+#   km_anual      : recorrido anual promedio por vehículo (AgenciaSE 2025)
+#   consumo_ve    : consumo específico BEV+PHEV en kWh/km (Arancibia 2025)
+#   rend_ice      : rendimiento equivalente del vehículo ICE sustituido en km/L
+#   fe_gasolina   : factor de emisión de la gasolina en kgCO₂/L (IPCC)
+#   fac_eq        : factor de equivalencia eléctrica BEV+PHEV (1.0 = demanda plena)
+#   pot_cargador  : potencia del cargador residencial Nivel 2 en kW (RIC N°15 SEC)
+#   fs_ng         : factor de simultaneidad sin gestión (ISCI 2024)
+#   fs_int        : factor de simultaneidad con carga inteligente BT1-SCH (ISCI 2024)
+#   fe_sen_*      : factor de emisión del SEN por año (PELP 2023-2032)
+#   fe_smacc_*    : factor de emisión del SEN según Plan SMACC (sensibilidad)
 # ==============================================================================
 
 println("\n" * "=" ^ 70)
@@ -438,25 +600,44 @@ println("FASE 2 — IMPACTO ELÉCTRICO Y AMBIENTAL NACIONAL")
 println("Escenario principal: Estrategia Integral")
 println("=" ^ 70)
 
-const km_anual      = 15_000.0
-const consumo_ve    =      0.18
-const rend_ice      =     12.0
-const fe_gasolina   =      2.3
-const fac_eq        =      1.0
-const pot_cargador  =      7.4
-const fs_ng         =      0.40
-const fs_int        =      0.15
-const fe_sen_2030   =      0.150
-const fe_sen_2035   =      0.100
-const fe_smacc_2030 =      0.00437
-const fe_smacc_2035 =      0.00417
+const km_anual      = 15_000.0   # km/año
+const consumo_ve    =      0.18  # kWh/km
+const rend_ice      =     12.0   # km/L
+const fe_gasolina   =      2.3   # kgCO₂/L
+const fac_eq        =      1.0   # factor equivalencia BEV+PHEV
+const pot_cargador  =      7.4   # kW — RIC N°15 SEC
+const fs_ng         =      0.40  # factor simultaneidad no gestionada (ISCI 2024)
+const fs_int        =      0.15  # factor simultaneidad carga inteligente (ISCI 2024)
+const fe_sen_2030   =      0.150 # tCO₂/MWh — Caso A conservador (PELP 2023-2032)
+const fe_sen_2035   =      0.100 # tCO₂/MWh — Caso A conservador (PELP 2023-2032)
+const fe_smacc_2030 =      0.00437 # tCO₂eq/MWh — Caso B Plan SMACC
+const fe_smacc_2035 =      0.00417 # tCO₂eq/MWh — Caso B Plan SMACC
 
-energia_anual_gwh(N)        = (N * km_anual * consumo_ve * fac_eq) / 1e6
+# Energía eléctrica anual demandada por el parque N(t) [GWh/año]
+# E = N × km_anual × consumo_ve / 1e6
+energia_anual_gwh(N) = (N * km_anual * consumo_ve * fac_eq) / 1e6
+
+# Potencia Coincidente de Carga [MW]
+# Representa la demanda simultánea de potencia en el momento de mayor carga.
+# P = N × FS × pot_cargador / 1000
+# FS = 0.40: escenario sin gestión (máximo estrés en red)
+# FS = 0.15: escenario con carga inteligente BT1-SCH (tarifa horaria)
 potencia_coincidente(N, fs) = (N * fs * pot_cargador * fac_eq) / 1_000
-litros_desplazados(N)       = (N * km_anual * fac_eq) / rend_ice
-co2_bruto_evitado(N)        = (litros_desplazados(N) * fe_gasolina) / 1_000
-emisiones_sen(E, fe)        = (E * 1_000.0) * fe
 
+# Combustible fósil desplazado [litros/año]
+# Asume que cada VE reemplaza un vehículo ICE de 12 km/L
+litros_desplazados(N) = (N * km_anual * fac_eq) / rend_ice
+
+# CO₂ bruto evitado [tCO₂/año]
+# Emisiones que ya no ocurren en el tubo de escape por no quemar gasolina
+co2_bruto_evitado(N) = (litros_desplazados(N) * fe_gasolina) / 1_000
+
+# CO₂ asociado al suministro eléctrico del SEN [tCO₂/año]
+# Descuenta el costo ambiental de generar la electricidad que carga los VE.
+# E_gwh se convierte a MWh multiplicando por 1000.
+emisiones_sen(E, fe) = (E * 1_000.0) * fe
+
+# Extracción de resultados de la Fase 1 para los hitos 2030 y 2035
 s2030_INT, N2030_INT, C2030_INT = obtener_estado_en_anio(sol_INT, 2030)
 s2035_INT, N2035_INT, C2035_INT = obtener_estado_en_anio(sol_INT, 2035)
 
@@ -466,6 +647,7 @@ println("Cuota BEV+PHEV        | $(round(s2030_INT*100,digits=1))%      | $(roun
 println("Parque BEV+PHEV       | $(round(Int,N2030_INT))  | $(round(Int,N2035_INT))")
 println("Cargadores públicos   | $(round(Int,C2030_INT))   | $(round(Int,C2035_INT))")
 
+# Punto de partida 2026: condición inicial N0 = 10.000 unidades
 N2026     = N0_REAL
 E2026     = energia_anual_gwh(N2026)
 E2030     = energia_anual_gwh(N2030_INT)
@@ -482,12 +664,16 @@ L2035 = litros_desplazados(N2035_INT)
 
 CO2_bruto_2030  = co2_bruto_evitado(N2030_INT)
 CO2_bruto_2035  = co2_bruto_evitado(N2035_INT)
+
+# Caso A: factor de emisión conservador (PELP 2023-2032)
 CO2_senA_2030   = emisiones_sen(E2030, fe_sen_2030)
 CO2_senA_2035   = emisiones_sen(E2035, fe_sen_2035)
-CO2_netoA_2030  = CO2_bruto_2030 - CO2_senA_2030
+CO2_netoA_2030  = CO2_bruto_2030 - CO2_senA_2030  # beneficio neto real
 CO2_netoA_2035  = CO2_bruto_2035 - CO2_senA_2035
-desc_A_2030     = CO2_senA_2030 / CO2_bruto_2030 * 100
+desc_A_2030     = CO2_senA_2030 / CO2_bruto_2030 * 100  # % de descuento
 desc_A_2035     = CO2_senA_2035 / CO2_bruto_2035 * 100
+
+# Caso B: sensibilidad con factor de emisión Plan SMACC (escenario optimista)
 CO2_senB_2030   = emisiones_sen(E2030, fe_smacc_2030)
 CO2_senB_2035   = emisiones_sen(E2035, fe_smacc_2035)
 CO2_netoB_2030  = CO2_bruto_2030 - CO2_senB_2030
@@ -514,13 +700,16 @@ println("Descuento Caso B       | $(round(desc_B_2030,digits=4))%  | $(round(des
 println("=" ^ 90)
 
 # ==============================================================================
-# GRÁFICO 5 — POTENCIA COINCIDENTE (con 2026)
+# GRÁFICO 5 — POTENCIA COINCIDENTE (con 2026 como punto de partida)
+# Muestra el contraste entre carga no gestionada y carga inteligente.
+# La diferencia entre barras rojas y azules es el ahorro de potencia
+# atribuible a la tarifa horaria residencial BT1-SCH.
 # ==============================================================================
 
 AÑOS_F2 = ["2026\n(Actual)", "2030", "2035"]
 X_F2    = [1, 2, 3]
 bw      = 0.24
-red_pct = round(Int, (1 - fs_int/fs_ng)*100)
+red_pct = round(Int, (1 - fs_int/fs_ng)*100)  # porcentaje de reducción
 
 pot_ng_v  = [P2026_ng,  P2030_ng,  P2035_ng ]
 pot_int_v = [P2026_int, P2030_int, P2035_int]
@@ -550,18 +739,20 @@ annotate!(p5, 1.4, maximum(pot_ng_v)*1.26,
     text("Reducción de −$(red_pct)% con carga gestionada (Fuente: ISCI)",
     9, :center, :darkblue))
 annotate!(p5, 3.35, -maximum(pot_ng_v)*0.08, text(NOTA_PIE,7,:right,:gray))
-savefig(p5, "MESA3_PRUEBA_g5_potencia_coincidente_nacional.png")
+savefig(p5, "DEFENSA_g5_potencia_coincidente_nacional.png")
 println("✓ G5 — Potencia coincidente (con 2026)")
 
 # ==============================================================================
-# GRÁFICO 6 — DEMANDA ANUAL DE ENERGÍA (con 2026)
+# GRÁFICO 6 — DEMANDA ANUAL DE ENERGÍA (con 2026 como punto de partida)
+# El color más claro en 2026 diferencia visualmente el dato observado
+# de las proyecciones del modelo (2030 y 2035).
 # ==============================================================================
 
 energia_v = [E2026, E2030, E2035]
 
 p6 = bar(
     X_F2, energia_v,
-    color=[:lightsteelblue, :steelblue, :steelblue],
+    color=[:lightsteelblue, :steelblue, :steelblue],  # 2026 más claro
     bar_width=0.50,
     title="Demanda anual de energía VE — Escenario: Estrategia Integral",
     xlabel="Año", ylabel="Energía [GWh/año]",
@@ -578,14 +769,16 @@ end
 annotate!(p6, 1.0, energia_v[1]+maximum(energia_v)*0.12,
     text("Punto de\npartida", 8, :center, :gray))
 annotate!(p6, 3.35, -maximum(energia_v)*0.08, text(NOTA_PIE,7,:right,:gray))
-savefig(p6, "MESA3_PRUEBA_g6_demanda_energia_nacional.png")
+savefig(p6, "DEFENSA_g6_demanda_energia_nacional.png")
 println("✓ G6 — Demanda anual de energía (con 2026)")
 
 # ==============================================================================
-# GRÁFICO 7 — COMBUSTIBLE DESPLAZADO
+# GRÁFICO 7 — COMBUSTIBLE FÓSIL DESPLAZADO
+# Cuantifica los litros de gasolina que ya no se consumen gracias a los VE.
+# Es el primer eslabón de la cadena de beneficio ambiental.
 # ==============================================================================
 
-litros_v = [L2030, L2035] ./ 1e6
+litros_v = [L2030, L2035] ./ 1e6  # convertir a millones de litros
 
 p7 = bar(
     X_TICKS, litros_v,
@@ -603,14 +796,17 @@ for i in 1:2
         text("$(round(litros_v[i],digits=1)) MM L/año", 10, :center))
 end
 annotate!(p7, 2.35, -maximum(litros_v)*0.08, text(NOTA_PIE,7,:right,:gray))
-savefig(p7, "MESA3_PRUEBA_g7_combustible_desplazado_nacional.png")
+savefig(p7, "DEFENSA_g7_combustible_desplazado_nacional.png")
 println("✓ G7 — Combustible desplazado")
 
 # ==============================================================================
 # GRÁFICO 8 — BENEFICIO AMBIENTAL NETO
+# Compara CO₂ bruto (emisiones evitadas en el tubo de escape) con CO₂ neto
+# (descontando las emisiones del SEN para generar la electricidad).
+# El Caso A usa el factor de emisión conservador del PELP 2023-2032.
 # ==============================================================================
 
-co2_bruto_v = [CO2_bruto_2030, CO2_bruto_2035] ./ 1000.0
+co2_bruto_v = [CO2_bruto_2030, CO2_bruto_2035] ./ 1000.0  # a ktCO₂
 co2_neto_v  = [CO2_netoA_2030, CO2_netoA_2035] ./ 1000.0
 
 p8 = bar(
@@ -636,11 +832,16 @@ annotate!(p8, 1.8, maximum(co2_bruto_v)*1.2,
     text("Descuento por emisiones SEN 2035: −$(round(desc_A_2035,digits=1))%",
     9, :center, :navy))
 annotate!(p8, 2.35, -maximum(co2_bruto_v)*0.08, text(NOTA_PIE,7,:right,:gray))
-savefig(p8, "MESA3_PRUEBA_g8_co2_bruto_neto_nacional.png")
+savefig(p8, "DEFENSA_g8_co2_bruto_neto_nacional.png")
 println("✓ G8 — Beneficio ambiental neto")
 
 # ==============================================================================
 # GRÁFICO 9 — EMISIONES ASOCIADAS AL SEN
+# Muestra el CO₂ que genera el SEN para producir la electricidad de carga.
+# Caso A (gris): factor conservador del PELP — representa la transición actual.
+# Caso B (azul): factor Plan SMACC — matriz renovable futura (casi cero emisiones).
+# La diferencia entre A y B cuantifica la sinergia entre electromovilidad y
+# descarbonización eléctrica.
 # ==============================================================================
 
 co2_senA_v = [CO2_senA_2030, CO2_senA_2035] ./ 1000.0
@@ -670,130 +871,14 @@ for i in 1:2
         text("$(round(co2_senB_v[i],digits=3)) kt", 9, :center))
 end
 annotate!(p9, 2.35, -maximum(co2_senA_v)*0.09, text(NOTA_PIE,7,:right,:gray))
-savefig(p9, "MESA3_PRUEBA_g9_emisiones_sen_nacional.png")
+savefig(p9, "DEFENSA_g9_emisiones_sen_nacional.png")
 println("✓ G9 — Emisiones asociadas al SEN")
 
-# ==============================================================================
-# 10. CASO COMPLEMENTARIO — QUIEBRE NORMATIVO 2035
-# ==============================================================================
-
-println("\n" * "=" ^ 80)
-println("CASO COMPLEMENTARIO — QUIEBRE NORMATIVO 2035")
-println("Prueba de estrés regulatoria: prohibición ICE desde 2035")
-println("=" ^ 80)
-
-s2030_QN, N2030_QN, C2030_QN = obtener_estado_en_anio(sol_QN, 2030)
-s2035_QN, N2035_QN, C2035_QN = obtener_estado_en_anio(sol_QN, 2035)
-s2040_QN, N2040_QN, C2040_QN = obtener_estado_en_anio(sol_QN, 2040)
-s2050_QN, N2050_QN, C2050_QN = obtener_estado_en_anio(sol_QN, 2050)
-
-println("\n--- ADOPCIÓN ---")
-println("Indicador       | 2030    | 2035    | 2040    | 2050")
-println("Cuota BEV+PHEV  | $(round(s2030_QN*100,digits=1))%   | $(round(s2035_QN*100,digits=1))%   | $(round(s2040_QN*100,digits=1))%   | $(round(s2050_QN*100,digits=1))%")
-println("Parque VE       | $(round(Int,N2030_QN)) | $(round(Int,N2035_QN)) | $(round(Int,N2040_QN)) | $(round(Int,N2050_QN))")
-println("Cargadores      | $(round(Int,C2030_QN))  | $(round(Int,C2035_QN))  | $(round(Int,C2040_QN))  | $(round(Int,C2050_QN))")
-
-E2035_QN  = energia_anual_gwh(N2035_QN)
-E2040_QN  = energia_anual_gwh(N2040_QN)
-E2050_QN  = energia_anual_gwh(N2050_QN)
-
-P2035_QN_ng  = potencia_coincidente(N2035_QN, fs_ng)
-P2040_QN_ng  = potencia_coincidente(N2040_QN, fs_ng)
-P2050_QN_ng  = potencia_coincidente(N2050_QN, fs_ng)
-P2035_QN_int = potencia_coincidente(N2035_QN, fs_int)
-P2040_QN_int = potencia_coincidente(N2040_QN, fs_int)
-P2050_QN_int = potencia_coincidente(N2050_QN, fs_int)
-
-println("\n--- IMPACTO ELÉCTRICO ACUMULADO ---")
-println("Indicador              | 2035    | 2040    | 2050")
-println("Energía [GWh/año]      | $(round(E2035_QN,digits=1))  | $(round(E2040_QN,digits=1))  | $(round(E2050_QN,digits=1))")
-println("Pot. no gest. [MW]     | $(round(P2035_QN_ng,digits=1))  | $(round(P2040_QN_ng,digits=1))  | $(round(P2050_QN_ng,digits=1))")
-println("Pot. inteligente [MW]  | $(round(P2035_QN_int,digits=1))  | $(round(P2040_QN_int,digits=1))  | $(round(P2050_QN_int,digits=1))")
-
-P_marg_ng  = VENTAS_ANUALES * pot_cargador * fs_ng  / 1_000
-P_marg_int = VENTAS_ANUALES * pot_cargador * fs_int / 1_000
-E_marg     = (VENTAS_ANUALES * km_anual * consumo_ve * fac_eq) / 1e6
-
-println("\n--- IMPACTO MARGINAL ANUAL (310.000 VE/año desde 2035) ---")
-println("Energía marginal       | $(round(E_marg,digits=1)) GWh/año")
-println("Pot. no gest.          | $(round(P_marg_ng,digits=1)) MW")
-println("Pot. gestionada        | $(round(P_marg_int,digits=1)) MW")
-println("Reducción por gestión  | $(round(P_marg_ng-P_marg_int,digits=1)) MW")
-
-# ------------------------------------------------------------------------------
-# GRÁFICO 10 — IMPACTO MARGINAL ANUAL
-# ------------------------------------------------------------------------------
-
-bw_qn = 0.26
-
-p10 = bar(
-    [1 - bw_qn/2], [P_marg_ng],
-    bar_width=bw_qn, label="Carga no gestionada (FS=40%)", color=:red,
-    title="Potencia marginal anual del Quiebre Normativo 2035\n(310.000 VE nuevos/año por mandato)",
-    xlabel="Desde 2035", ylabel="Potencia coincidente marginal [MW/año]",
-    xticks=([1], ["2035\nMandato"]), legend=:topleft,
-    framestyle=:box, gridalpha=0.4,
-    ylims=(0, P_marg_ng*1.35),
-    titlefontsize=FONT_TITLE-1, guidefontsize=FONT_GUIDE,
-    tickfontsize=FONT_TICK, legendfontsize=FONT_LEGEND, size=(800,500)
-)
-bar!(p10, [1 + bw_qn/2], [P_marg_int],
-    bar_width=bw_qn, label="Carga gestionada (FS=15%)", color=:dodgerblue)
-annotate!(p10, 1-bw_qn/2, P_marg_ng+P_marg_ng*0.05,
-    text("$(round(P_marg_ng,digits=1)) MW/año", 10, :center))
-annotate!(p10, 1+bw_qn/2, P_marg_int+P_marg_ng*0.05,
-    text("$(round(P_marg_int,digits=1)) MW/año", 10, :center))
-annotate!(p10, 1.0, P_marg_ng*1.23,
-    text("310.000 VE/año × 7,4 kW × FS", 9, :center, :darkblue))
-annotate!(p10, 1.35, -P_marg_ng*0.09, text(NOTA_PIE,7,:right,:gray))
-savefig(p10, "MESA3_PRUEBA_g10_quiebre_normativo_impacto_marginal.png")
-println("✓ G10 — Impacto marginal anual Quiebre Normativo")
-
-# ------------------------------------------------------------------------------
-# GRÁFICO 11 — COMPARACIÓN POTENCIA ACUMULADA: INTEGRAL vs QUIEBRE
-# ------------------------------------------------------------------------------
-
-x_comp      = [1, 2, 3]
-labels_comp = ["2035", "2040", "2050"]
-
-_, N_INT_2040, _ = obtener_estado_en_anio(sol_INT, 2040)
-_, N_INT_2050, _ = obtener_estado_en_anio(sol_INT, 2050)
-
-pot_ng_INT = [potencia_coincidente(N2035_INT,  fs_ng),
-              potencia_coincidente(N_INT_2040, fs_ng),
-              potencia_coincidente(N_INT_2050, fs_ng)]
-pot_ng_QN  = [P2035_QN_ng, P2040_QN_ng, P2050_QN_ng]
-
-p11 = bar(
-    x_comp .- bw/2, pot_ng_INT,
-    bar_width=bw, label="Estrategia Integral", color=:green,
-    title="Potencia Coincidente no gestionada — Integral vs. Quiebre Normativo",
-    xlabel="Año", ylabel="Potencia coincidente [MW]",
-    xticks=(x_comp, labels_comp), legend=:topleft,
-    framestyle=:box, gridalpha=0.4,
-    ylims=(0, maximum(pot_ng_QN)*1.28),
-    yformatter=y->string(round(Int,y)),
-    titlefontsize=FONT_TITLE, guidefontsize=FONT_GUIDE,
-    tickfontsize=FONT_TICK, legendfontsize=FONT_LEGEND, size=(800,500)
-)
-bar!(p11, x_comp .+ bw/2, pot_ng_QN,
-    bar_width=bw, label="Quiebre Normativo 2035", color=:blue)
-for i in 1:3
-    annotate!(p11, x_comp[i]-bw/2, pot_ng_INT[i]+maximum(pot_ng_QN)*0.03,
-        text("$(round(Int,pot_ng_INT[i])) MW", 8, :center))
-    annotate!(p11, x_comp[i]+bw/2, pot_ng_QN[i]+maximum(pot_ng_QN)*0.03,
-        text("$(round(Int,pot_ng_QN[i])) MW", 8, :center))
-end
-annotate!(p11, 3.35, -maximum(pot_ng_QN)*0.07, text(NOTA_PIE,7,:right,:gray))
-savefig(p11, "MESA3_PRUEBA_g11_integral_vs_quiebre_potencia.png")
-println("✓ G11 — Comparación Integral vs. Quiebre Normativo")
-
 println("\n" * "=" ^ 70)
-println("MODELO INTEGRADO COMPLETADO — 11 gráficos generados")
-println("G1  g1_parque_acumulado          G7  g7_combustible_desplazado")
-println("G2  g2_cuota_ventas              G8  g8_co2_bruto_neto")
-println("G3  g3_ventas_anuales_bev_phev   G9  g9_emisiones_sen")
-println("G4  g4_tipping_points_cuota      G10 g10_quiebre_impacto_marginal")
-println("G5  g5_potencia_coincidente      G11 g11_integral_vs_quiebre")
-println("G6  g6_demanda_energia")
+println("MODELO COMPLETADO — 9 gráficos generados")
+println("G1  g1_parque_acumulado          G6  g6_demanda_energia")
+println("G2  g2_cuota_ventas              G7  g7_combustible_desplazado")
+println("G3  g3_ventas_anuales_bev_phev   G8  g8_co2_bruto_neto")
+println("G4  g4_tipping_points_cuota      G9  g9_emisiones_sen")
+println("G5  g5_potencia_coincidente")
 println("=" ^ 70)

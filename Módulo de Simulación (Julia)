@@ -875,10 +875,305 @@ savefig(p9, "DEFENSA_g9_emisiones_sen_nacional.png")
 println("✓ G9 — Emisiones asociadas al SEN")
 
 println("\n" * "=" ^ 70)
-println("MODELO COMPLETADO — 9 gráficos generados")
+println("MODELO COMPLETADO — 9 gráficos generados")0
 println("G1  g1_parque_acumulado          G6  g6_demanda_energia")
 println("G2  g2_cuota_ventas              G7  g7_combustible_desplazado")
 println("G3  g3_ventas_anuales_bev_phev   G8  g8_co2_bruto_neto")
 println("G4  g4_tipping_points_cuota      G9  g9_emisiones_sen")
 println("G5  g5_potencia_coincidente")
 println("=" ^ 70)
+
+# ==============================================================================
+# 10. ANÁLISIS DE SENSIBILIDAD PARAMÉTRICA
+#
+# Objetivo:
+# Evaluar cómo cambian los resultados principales del escenario Estrategia Integral
+# cuando se modifica, de manera individual, cada una de las principales palancas
+# del modelo:
+#
+#   - F_pol             : intensidad relativa de política pública
+#   - F_infra           : efecto de infraestructura sobre la adopción
+#   - F_IPS             : sensibilidad al Índice de Percepción Social
+#   - B_eAHP            : fricción estructural del mercado
+#   - inversion_publica : expansión exógena de cargadores públicos
+#
+# La sensibilidad se realiza bajo el principio ceteris paribus:
+# se modifica un parámetro a la vez y todos los demás permanecen constantes.
+#
+# El escenario base de comparación es Estrategia Integral.
+# ==============================================================================
+
+println("\n" * "=" ^ 90)
+println("ANÁLISIS DE SENSIBILIDAD — ESCENARIO ESTRATEGIA INTEGRAL")
+println("=" ^ 90)
+
+# Escenario base para el análisis de sensibilidad
+const ESC_BASE_SENS = EscenarioMesa2(
+    "Estrategia Integral",
+    :INTEGRAL,
+    1.30,
+    1.30,
+    1.25,
+    0.75,
+    250.0
+)
+
+# Variaciones relativas aplicadas a cada parámetro.
+# Por ejemplo, -0.30 representa una reducción de 30% respecto del valor base.
+const VARIACIONES_SENS = [-0.30, -0.20, -0.10, 0.10, 0.20, 0.30]
+
+# ------------------------------------------------------------------------------
+# Función auxiliar: crea una copia del escenario base modificando solo un parámetro.
+# ------------------------------------------------------------------------------
+
+function modificar_parametro_escenario(esc::EscenarioMesa2, parametro::Symbol, variacion::Float64)
+
+    if parametro == :F_pol
+        return EscenarioMesa2(
+            "Sensibilidad F_pol",
+            :SENS,
+            esc.F_pol * (1.0 + variacion),
+            esc.F_infra,
+            esc.F_IPS,
+            esc.B_eAHP,
+            esc.inversion_publica
+        )
+
+    elseif parametro == :F_infra
+        return EscenarioMesa2(
+            "Sensibilidad F_infra",
+            :SENS,
+            esc.F_pol,
+            esc.F_infra * (1.0 + variacion),
+            esc.F_IPS,
+            esc.B_eAHP,
+            esc.inversion_publica
+        )
+
+    elseif parametro == :F_IPS
+        return EscenarioMesa2(
+            "Sensibilidad F_IPS",
+            :SENS,
+            esc.F_pol,
+            esc.F_infra,
+            esc.F_IPS * (1.0 + variacion),
+            esc.B_eAHP,
+            esc.inversion_publica
+        )
+
+    elseif parametro == :B_eAHP
+        return EscenarioMesa2(
+            "Sensibilidad B_eAHP",
+            :SENS,
+            esc.F_pol,
+            esc.F_infra,
+            esc.F_IPS,
+            esc.B_eAHP * (1.0 + variacion),
+            esc.inversion_publica
+        )
+
+    elseif parametro == :inversion_publica
+        return EscenarioMesa2(
+            "Sensibilidad inversion_publica",
+            :SENS,
+            esc.F_pol,
+            esc.F_infra,
+            esc.F_IPS,
+            esc.B_eAHP,
+            esc.inversion_publica * (1.0 + variacion)
+        )
+
+    else
+        error("Parámetro no reconocido: $parametro")
+    end
+end
+
+# ------------------------------------------------------------------------------
+# Función auxiliar: simula un escenario y extrae indicadores principales.
+# ------------------------------------------------------------------------------
+
+function indicadores_sensibilidad(esc::EscenarioMesa2)
+
+    # Resolver sistema ODE con el escenario modificado
+    prob = ODEProblem(modelo_stockflow!, u0, tspan, esc)
+    sol  = solve(prob, Tsit5(), saveat=1.0)
+
+    # Extraer estados en 2030 y 2035
+    s30, N30, C30 = obtener_estado_en_anio(sol, 2030)
+    s35, N35, C35 = obtener_estado_en_anio(sol, 2035)
+
+    # Calcular potencia coincidente no gestionada al 2035
+    # Se utiliza FS = 40%, consistente con el escenario de máximo estrés de red.
+    P35_ng = potencia_coincidente(N35, fs_ng)
+
+    # Calcular potencia coincidente con carga inteligente al 2035
+    # Se utiliza FS = 15%, consistente con el supuesto de carga gestionada.
+    P35_int = potencia_coincidente(N35, fs_int)
+
+    return (
+        s2030 = s30,
+        s2035 = s35,
+        N2035 = N35,
+        C2035 = C35,
+        P2035_ng = P35_ng,
+        P2035_int = P35_int
+    )
+end
+
+# ------------------------------------------------------------------------------
+# Resultados base para comparar variaciones.
+# ------------------------------------------------------------------------------
+
+base_ind = indicadores_sensibilidad(ESC_BASE_SENS)
+
+println("\n--- Caso base: Estrategia Integral ---")
+println("s2030              = $(round(base_ind.s2030*100,digits=2))%")
+println("s2035              = $(round(base_ind.s2035*100,digits=2))%")
+println("N2035              = $(round(Int,base_ind.N2035))")
+println("C2035              = $(round(Int,base_ind.C2035))")
+println("P2035 no gestionada = $(round(base_ind.P2035_ng,digits=1)) MW")
+println("P2035 inteligente   = $(round(base_ind.P2035_int,digits=1)) MW")
+
+# ------------------------------------------------------------------------------
+# Tabla detallada de sensibilidad.
+# ------------------------------------------------------------------------------
+
+parametros_sens = [
+    (:F_pol, "F_pol"),
+    (:F_infra, "F_infra"),
+    (:F_IPS, "F_IPS"),
+    (:B_eAHP, "B_eAHP"),
+    (:inversion_publica, "I_publica")
+]
+
+println("\n" * "=" ^ 120)
+println("TABLA DETALLADA DE SENSIBILIDAD")
+println("=" ^ 120)
+println(
+    rpad("Parámetro",14), " | ",
+    rpad("Variación",10), " | ",
+    rpad("s2030",8), " | ",
+    rpad("s2035",8), " | ",
+    rpad("Δs2035",9), " | ",
+    rpad("N2035",10), " | ",
+    rpad("ΔN2035",10), " | ",
+    rpad("P NG 2035",11), " | ",
+    rpad("P INT 2035",11)
+)
+println("-" ^ 120)
+
+# Diccionario para guardar resultados y usarlos después en una tabla resumen
+resultados_sensibilidad = Dict{Symbol, Vector{Any}}()
+
+for (parametro, nombre_parametro) in parametros_sens
+
+    resultados_sensibilidad[parametro] = Any[]
+
+    for variacion in VARIACIONES_SENS
+
+        esc_mod = modificar_parametro_escenario(ESC_BASE_SENS, parametro, variacion)
+        ind = indicadores_sensibilidad(esc_mod)
+
+        delta_s35 = (ind.s2035 - base_ind.s2035) * 100
+        delta_N35 = ind.N2035 - base_ind.N2035
+
+        push!(resultados_sensibilidad[parametro], (
+            variacion = variacion,
+            s2030 = ind.s2030,
+            s2035 = ind.s2035,
+            delta_s2035 = delta_s35,
+            N2035 = ind.N2035,
+            delta_N2035 = delta_N35,
+            P2035_ng = ind.P2035_ng,
+            P2035_int = ind.P2035_int
+        ))
+
+        println(
+            rpad(nombre_parametro,14), " | ",
+            rpad("$(round(variacion*100,digits=0))%",10), " | ",
+            rpad("$(round(ind.s2030*100,digits=1))%",8), " | ",
+            rpad("$(round(ind.s2035*100,digits=1))%",8), " | ",
+            rpad("$(round(delta_s35,digits=2)) pp",9), " | ",
+            rpad(round(Int,ind.N2035),10), " | ",
+            rpad(round(Int,delta_N35),10), " | ",
+            rpad("$(round(ind.P2035_ng,digits=1)) MW",11), " | ",
+            rpad("$(round(ind.P2035_int,digits=1)) MW",11)
+        )
+    end
+
+    println("-" ^ 120)
+end
+
+# ------------------------------------------------------------------------------
+# Tabla resumen: rango de variación de s2035 por parámetro.
+#
+# Esta tabla permite identificar qué variable tiene mayor incidencia sobre
+# la cuota de ventas al año 2035.
+# ------------------------------------------------------------------------------
+
+println("\n" * "=" ^ 90)
+println("RESUMEN DE SENSIBILIDAD SOBRE s2035")
+println("=" ^ 90)
+println(
+    rpad("Parámetro",16), " | ",
+    rpad("s2035 mínimo",14), " | ",
+    rpad("s2035 máximo",14), " | ",
+    rpad("Rango",12), " | ",
+    "Interpretación"
+)
+println("-" ^ 90)
+
+for (parametro, nombre_parametro) in parametros_sens
+
+    vals_s35 = [r.s2035 * 100 for r in resultados_sensibilidad[parametro]]
+    s_min = minimum(vals_s35)
+    s_max = maximum(vals_s35)
+    rango = s_max - s_min
+
+    interpretacion = if rango >= 20
+        "Alta sensibilidad"
+    elseif rango >= 10
+        "Sensibilidad media"
+    else
+        "Baja sensibilidad"
+    end
+
+    println(
+        rpad(nombre_parametro,16), " | ",
+        rpad("$(round(s_min,digits=1))%",14), " | ",
+        rpad("$(round(s_max,digits=1))%",14), " | ",
+        rpad("$(round(rango,digits=1)) pp",12), " | ",
+        interpretacion
+    )
+end
+
+println("=" ^ 90)
+
+# ------------------------------------------------------------------------------
+# Exportación opcional a CSV para usar los resultados en el informe.
+# ------------------------------------------------------------------------------
+
+open("sensibilidad_estrategia_integral.csv", "w") do io
+
+    println(io, "Parametro,Variacion,s2030,s2035,Delta_s2035_pp,N2035,Delta_N2035,P2035_no_gestionada_MW,P2035_inteligente_MW")
+
+    for (parametro, nombre_parametro) in parametros_sens
+        for r in resultados_sensibilidad[parametro]
+            println(io,
+                "$nombre_parametro," *
+                "$(r.variacion)," *
+                "$(r.s2030)," *
+                "$(r.s2035)," *
+                "$(r.delta_s2035)," *
+                "$(r.N2035)," *
+                "$(r.delta_N2035)," *
+                "$(r.P2035_ng)," *
+                "$(r.P2035_int)"
+            )
+        end
+    end
+end
+
+println("\n✓ Archivo generado: sensibilidad_estrategia_integral.csv")
+println("✓ Análisis de sensibilidad completado.")
+println("=" ^ 90)

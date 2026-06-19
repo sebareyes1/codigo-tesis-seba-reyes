@@ -1,3 +1,25 @@
+# =============================================================================
+# Script PLN/e-AHP para generar insumos dinámicos del modelo de adopción BEV+PHEV
+# -----------------------------------------------------------------------------
+# Propósito general:
+# 1) Procesar un corpus textual nacional sobre electromovilidad.
+# 2) Convertir cada texto en un embedding semántico usando BERT/Tulio.
+# 3) Calcular un Índice de Percepción Social (IPS).
+# 4) Estimar polaridades netas de barreras e impulsores mediante e-AHP semántico.
+# 5) Exportar un CSV que luego será utilizado por el simulador en Julia.
+#
+# Importante: esta versión solo agrega comentarios explicativos.
+# No modifica ninguna instrucción ejecutable del código original.
+# =============================================================================
+
+# Librerías estándar y científicas utilizadas por el script.
+# sys permite cerrar el programa ante errores críticos.
+# csv permite exportar los resultados procesados en formato compatible con Julia.
+# numpy se usa para operaciones vectoriales y cálculo de normas/dot product.
+# torch ejecuta el modelo de lenguaje BERT sin entrenamiento adicional.
+# pathlib permite definir rutas portables, independientes del sistema operativo.
+# defaultdict simplifica el agrupamiento anual de resultados.
+# transformers carga el tokenizer y el modelo Tulio/BERT desde Hugging Face.
 import sys
 import csv
 import numpy as np
@@ -9,7 +31,10 @@ from transformers import AutoTokenizer, AutoModel
 # ------------------------------------------------------------------------------
 # 1. RUTAS PORTABLES
 # ------------------------------------------------------------------------------
+# BASE_DIR identifica la carpeta donde está guardado este script.
+# Esto evita escribir rutas absolutas y hace que el código sea portable.
 BASE_DIR = Path(__file__).parent
+# RUTA_SALIDA define el archivo CSV que se generará para alimentar el modelo en Julia.
 RUTA_SALIDA = BASE_DIR / "input_pln_dinamico_local.csv"
 
 # ------------------------------------------------------------------------------
@@ -18,12 +43,19 @@ RUTA_SALIDA = BASE_DIR / "input_pln_dinamico_local.csv"
 print("--- Inicializando Inteligencia Artificial Local ---")
 print("Cargando modelo lingüístico de la Universidad de Chile (BETO)...")
 
+# El bloque try/except permite intentar cargar el modelo lingüístico local y detener
+# el programa de manera controlada si falta alguna librería o conexión/modelo.
 try:
+    # Nombre del modelo BERT especializado en español chileno.
     nombre_modelo = "dccuchile/tulio-chilean-spanish-bert"
+    # El tokenizer convierte texto crudo en tokens numéricos que el modelo puede leer.
     tokenizer = AutoTokenizer.from_pretrained(nombre_modelo)
+    # AutoModel carga la red neuronal BERT que genera embeddings contextuales.
     modelo_local = AutoModel.from_pretrained(nombre_modelo)
+    # eval() deja el modelo en modo inferencia: no se entrenan pesos ni se actualizan gradientes.
     modelo_local.eval()
     print("✅ Modelo local 'Tulio' cargado y listo en tu procesador.")
+# Si la carga falla, se informa el error y se termina la ejecución para evitar salidas incompletas.
 except Exception as e:
     print(f"\n[ERROR] Falló la carga del modelo: {e}")
     print("Asegúrate de tener instaladas las librerías: pip install transformers torch")
@@ -32,20 +64,47 @@ except Exception as e:
 # ------------------------------------------------------------------------------
 # 3. FUNCIONES MATEMÁTICAS CORE
 # ------------------------------------------------------------------------------
+# Función: similitud_coseno
+# Mide la cercanía semántica entre dos vectores.
+# Matemáticamente corresponde a:
+# cos(theta) = (vec_a · vec_b) / (||vec_a|| ||vec_b||)
+# Valores cercanos a 1 indican alta similitud conceptual; valores cercanos a 0
+# indican baja relación semántica en el espacio vectorial.
 def similitud_coseno(vec_a, vec_b):
+    # Norma euclidiana del primer vector: ||vec_a||.
     norma_a = np.linalg.norm(vec_a)
+    # Norma euclidiana del segundo vector: ||vec_b||.
     norma_b = np.linalg.norm(vec_b)
+    # Si alguno de los vectores es nulo, se evita una división por cero.
     if norma_a == 0 or norma_b == 0: return 0.0
+    # Producto punto normalizado por las magnitudes de ambos vectores.
     return float(np.dot(vec_a, vec_b) / (norma_a * norma_b))
 
+# Función: obtener_embedding
+# Transforma un texto en un vector numérico de alta dimensión.
+# Este vector resume el significado contextual del texto y permite compararlo
+# con las anclas semánticas mediante similitud coseno.
 def obtener_embedding(texto):
     # Transforma texto en un vector espacial usando el modelo local
+    # Tokenización del texto. truncation=True corta textos largos y max_length=512
+    # respeta el límite típico de entrada de modelos BERT.
     inputs = tokenizer(texto, return_tensors="pt", truncation=True, max_length=512)
+    # torch.no_grad() desactiva el cálculo de gradientes, reduciendo memoria y tiempo
+    # porque el modelo solo se usa para inferencia, no para entrenamiento.
     with torch.no_grad():
+        # El modelo entrega representaciones vectoriales para cada token del texto.
         outputs = modelo_local(**inputs)
     # Extraemos el vector promediado de las palabras
+    # Promedio de los embeddings de tokens: genera un único vector representativo
+    # para todo el documento/noticia. squeeze() elimina dimensiones unitarias y
+    # numpy() convierte el tensor de PyTorch a arreglo NumPy.
     return outputs.last_hidden_state.mean(dim=1).squeeze().numpy()
 
+# Función: similitud_a_score_ips
+# Convierte la similitud semántica promedio con el ancla de adopción en un
+# puntaje IPS discreto entre 1 y 10.
+# El objetivo es expandir pequeñas diferencias de similitud del modelo BERT
+# hacia una escala interpretable para el modelo dinámico.
 def similitud_a_score_ips(similitud_media):
     # Auditoría
     print(f"   -> [Auditoría] Similitud matemática cruda: {similitud_media:.4f}")
@@ -56,19 +115,36 @@ def similitud_a_score_ips(similitud_media):
     sim_max = 0.9350  # Techo: Cualquier cosa mayor o igual a esto será un IPS alto (9-10)
     
     # Expansión de Contraste
+    # Acota la similitud al intervalo calibrado [sim_min, sim_max].
+    # Esto evita que valores extremos distorsionen el IPS.
     sim_clampeada = max(sim_min, min(sim_max, similitud_media))
+    # Reescalamiento lineal de la similitud acotada hacia la escala 1-10:
+    # score_raw = ((sim - sim_min)/(sim_max - sim_min))*9 + 1.
     score_raw = ((sim_clampeada - sim_min) / (sim_max - sim_min)) * 9.0 + 1.0
+    # Redondea el IPS y asegura que el resultado final quede entre 1 y 10.
     return max(1, min(10, round(score_raw)))
 
+# Función: normalizar_pesos
+# Convierte similitudes semánticas positivas en ponderaciones relativas.
+# La suma de todos los pesos normalizados queda igual a 1, lo que permite
+# interpretar cada dimensión como participación relativa dentro del e-AHP semántico.
 def normalizar_pesos(pesos):
+    # Suma total de similitudes positivas asociadas a las anclas.
     total = sum(pesos.values())
+    # Si todas las similitudes son cero, se asigna el mismo peso a cada ancla
+    # para evitar división por cero y mantener una distribución válida.
     if total == 0:
         return {k: round(1.0 / len(pesos), 4) for k in pesos}
+    # Normalización estándar: peso_i = valor_i / suma_total.
     return {k: round(v / total, 4) for k, v in pesos.items()}
 
 # ------------------------------------------------------------------------------
 # 4. ANCLAS SEMÁNTICAS ABSOLUTAS (e-AHP DIRECCIONAL)
 # ------------------------------------------------------------------------------
+# Diccionario de anclas semánticas usadas en el e-AHP direccional.
+# Cada ancla funciona como un concepto de referencia. Las noticias se comparan
+# contra estas frases para estimar si el discurso se acerca más a barreras
+# o a impulsores de adopción.
 ANCLAS_AHP = {
     # --- BARRERAS (EL FRENO / POLARIDAD NEGATIVA) ---
     "w_barrera_econom": "Alto costo de adquisición, precio de compra elevado, tecnología cara, inaccesible, falta de financiamiento, alto CAPEX.",
@@ -81,18 +157,27 @@ ANCLAS_AHP = {
     "w_impulso_infra": "Nuevas electrolineras, expansión de red de carga, cargadores rápidos Modo 3, inauguración de puntos de recarga SEC, cobertura total."
 }
 
+# Esta frase opera como ancla general de adopción.
+# Su similitud con cada noticia se transforma posteriormente en el IPS global.
 # El ancla de adopción general se mantiene igual (es el IPS global)
 ANCLA_ADOPCION = "Crecimiento de ventas de vehículos eléctricos, adopción acelerada, aumento de la flota eléctrica, récord de ventas, transición exitosa."
 # ------------------------------------------------------------------------------
 # 5. PRE-CALCULAR EMBEDDINGS DE LAS ANCLAS
 # ------------------------------------------------------------------------------
+# Antes de procesar noticias, se calculan los embeddings de todas las anclas.
+# Esto evita recalcularlos en cada iteración y reduce el tiempo de ejecución.
 print("\n📐 Pre-calculando vectores semánticos de las Anclas...")
+# Diccionario que asocia cada nombre de ancla con su vector embedding.
 VECS_ANCLAS = {nombre: obtener_embedding(texto) for nombre, texto in ANCLAS_AHP.items()}
+# Vector embedding del ancla general de adopción, utilizado para calcular el IPS.
 VEC_ADOPCION = obtener_embedding(ANCLA_ADOPCION)
 
 # ------------------------------------------------------------------------------
 # 6. CORPUS DE NOTICIAS ESTRATÉGICO (2018 - 2035)
 # ------------------------------------------------------------------------------
+# Corpus de entrada: lista de tuplas (fecha, texto).
+# Cada registro representa un hito, noticia o señal institucional relevante
+# para caracterizar el entorno sociotécnico de la electromovilidad.
 noticias_batch = [
     ("2018-12-15",
      "Llegan a Chile los primeros buses eléctricos para el transporte público de Santiago, marcando un hito inicial de electromovilidad urbana."),
@@ -126,34 +211,58 @@ noticias_batch = [
 # ------------------------------------------------------------------------------
 # 7. MOTOR DE ANÁLISIS MULTIDIMENSIONAL
 # ------------------------------------------------------------------------------
+# Lista donde se guardan los resultados detallados por noticia.
 datos_procesados = []
+# Estructura de acumulación anual. Para cada año se almacenan listas de IPS
+# y polaridades netas, que luego se promedian para exportar una serie anual.
 resumen_por_anio = defaultdict(lambda: {"scores_ips": [], "w_econom": [], "w_social": [], "w_infra": []})
 
 print("\n[INFO] Procesando el corpus de noticias (Calibración y Escenarios)...")
 print("-" * 75)
 
+# Bucle principal de procesamiento.
+# Cada noticia se transforma en embedding, se compara con las anclas, se calcula
+# su IPS y se extraen polaridades netas económica, social e infraestructural.
 for fecha, texto in noticias_batch:
+    # Convierte el texto de la noticia en un vector semántico.
     vec_noticia = obtener_embedding(texto)
     
     # 7.1 Calcular IPS Global
+    # Similitud entre la noticia y el ancla general de adopción.
+    # Esta variable representa la cercanía del discurso con una narrativa
+    # favorable a la masificación de la electromovilidad.
     sim_adopcion = similitud_coseno(vec_noticia, VEC_ADOPCION)
+    # Conversión de la similitud semántica a puntaje IPS entre 1 y 10.
     score_ips = similitud_a_score_ips(sim_adopcion)
     
     # 7.2 Calcular Pesos e-AHP
+    # Para cada ancla del e-AHP, calcula similitud coseno con la noticia.
+    # max(0.0, ...) elimina similitudes negativas para conservar solo cercanías
+    # semánticas positivas dentro de la normalización de pesos.
     sims_ahp = {nombre: max(0.0, similitud_coseno(vec_noticia, vec)) for nombre, vec in VECS_ANCLAS.items()}
+    # Normaliza las similitudes para obtener pesos relativos cuya suma es 1.
     pesos = normalizar_pesos(sims_ahp)
     
     # --- CÁLCULO DE POLARIDAD NETA (IMPULSO - BARRERA) ---
+    # Polaridad económica neta = peso de impulso económico - peso de barrera económica.
+    # Si el valor es positivo, predomina una señal económica favorable; si es negativo,
+    # predomina una barrera de costo, financiamiento o accesibilidad.
     neto_econom = pesos["w_impulso_econom"] - pesos["w_barrera_econom"]
+    # Polaridad social neta = confianza/aceptación - desconfianza/riesgo percibido.
     neto_social = pesos["w_impulso_social"] - pesos["w_barrera_social"]
+    # Polaridad de infraestructura neta = expansión/disponibilidad - déficit de carga.
     neto_infra  = pesos["w_impulso_infra"] - pesos["w_barrera_infra"]
     
+    # Impresión de auditoría para revisar manualmente el resultado de cada noticia.
     print(f"[{fecha}] IPS: {score_ips}/10 | Eco Neto={neto_econom:.3f}, Soc Neto={neto_social:.3f}, Inf Neto={neto_infra:.3f}")
     
     # 7.3 Guardar en memoria los valores NETOS
+    # Guarda la fila detallada que luego será exportada en la primera tabla del CSV.
     datos_procesados.append([fecha, texto, score_ips, "Análisis NLP Local", neto_econom, neto_social, neto_infra])
     
+    # Extrae el año desde la fecha para construir el resumen anual.
     anio = int(fecha[:4])
+    # Acumula el IPS y las polaridades netas en su año correspondiente.
     resumen_por_anio[anio]["scores_ips"].append(score_ips)
     resumen_por_anio[anio]["w_econom"].append(neto_econom)
     resumen_por_anio[anio]["w_social"].append(neto_social)
@@ -163,7 +272,10 @@ for fecha, texto in noticias_batch:
 # 8. EXPORTAR CSV PARA JULIA (Con soporte UTF-8)
 # ------------------------------------------------------------------------------
 try:
+    # Abre el archivo CSV de salida.
+    # utf-8-sig mejora la compatibilidad con Excel y conserva caracteres especiales.
     with open(RUTA_SALIDA, mode='w', newline='', encoding='utf-8-sig') as file:
+        # Objeto escritor encargado de enviar filas al archivo CSV.
         writer = csv.writer(file)
         
         # --- TABLA A: Datos por noticia ---
@@ -176,10 +288,16 @@ try:
         # --- TABLA B: Resumen para Julia ---
         writer.writerow(["Anio", "IPS_Score_Promedio", "IPS_Normalizado", "w_econom_anual", "w_social_anual", "w_infra_anual", "N_Noticias"])
         
+        # Recorre los años en orden cronológico para generar la serie anual utilizada en Julia.
         for anio, datos in sorted(resumen_por_anio.items()):
+            # Función auxiliar local para calcular promedios evitando errores con listas vacías.
             prom = lambda lst: sum(lst) / len(lst) if lst else 0.0
+            # Promedio anual del IPS discreto.
             ips_prom = prom(datos["scores_ips"])
             
+            # Exporta una fila anual con IPS promedio, IPS normalizado y polaridades promedio.
+            # IPS_Normalizado = (IPS_promedio - 5)/5, lo que transforma la escala 1-10
+            # en una señal centrada aproximadamente en cero para el simulador dinámico.
             writer.writerow([
                 anio,
                 round(ips_prom, 2),
@@ -190,8 +308,10 @@ try:
                 len(datos["scores_ips"])
             ])
             
+    # Mensaje final de éxito, indicando la ubicación del archivo generado.
     print("-" * 75)
     print(f"✅ [SUCCESS] Matriz matemática generada. CSV guardado en:\n{RUTA_SALIDA}")
+# Captura errores de escritura, por ejemplo si el CSV está abierto en Excel.
 except OSError as e:
     print(f"[ERROR] No se pudo guardar el CSV: {e}")
     print("Asegúrate de que el archivo Excel NO esté abierto en tu computador.")

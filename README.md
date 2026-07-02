@@ -10,19 +10,20 @@ Este repositorio implementa la arquitectura computacional híbrida desarrollada 
 
 **Módulo de Simulación (Julia):** Resuelve numéricamente el sistema de tres ecuaciones diferenciales ordinarias acopladas (Bass normalizado + Stock and Flow) mediante el solver Tsit5 de `DifferentialEquations.jl`. Simula cuatro escenarios (BAU, Impulso Económico, Estrategia Integral y Objetivo ENE), calcula impactos eléctricos y ambientales, y ejecuta análisis de sensibilidad paramétrica sobre los parámetros de escenario y los pesos base del procedimiento PSC.
 
-## Estructura del repositorio:
+## Estructura del repositorio
+
+```
 /python
-│   pln_embeddings.py        # Procesamiento del corpus y cálculo de embeddings
-│   eahp_semantico.py        # Procedimiento PSC: anclas, similitud coseno, IPS
-│   input_pln_dinamico_local.csv  # CSV de salida hacia Julia
+│   pln_embeddings.py                    # Procesamiento del corpus y cálculo de embeddings
+│   eahp_semantico.py                    # Procedimiento PSC: anclas, similitud coseno, IPS
+│   input_pln_dinamico_local.csv         # CSV de salida hacia Julia
 │
 /julia
-│   simulador_nacional.jl    # Simulador principal: ODEs, escenarios, impactos
-│   sensibilidad_psc.jl      # Análisis de sensibilidad sobre pesos PSC
-│   sensibilidad_estrategia_integral.csv  # Resultados sensibilidad paramétrica
-│   sensibilidad_pesos_psc.csv            # Resultados sensibilidad PSC
-
-
+│   simulador_nacional.jl                # Simulador principal: ODEs, escenarios, impactos
+│   sensibilidad_psc.jl                  # Análisis de sensibilidad sobre pesos PSC
+│   sensibilidad_estrategia_integral.csv # Resultados sensibilidad paramétrica
+│   sensibilidad_pesos_psc.csv           # Resultados sensibilidad PSC
+```
 ## Requisitos
 
 **Python**

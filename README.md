@@ -1,7 +1,12 @@
-## Dinámicas de Largo Plazo en la Adopción de Vehículos Eléctricos en Chile
+# Dinámicas de Largo Plazo en la Adopción de Vehículos Eléctricos en Chile
 
 Repositorio de código fuente asociado al Proyecto de Título de Ingeniería Civil Eléctrica — Pontificia Universidad Católica de Valparaíso.
 
+**Autor:** Sebastián Andrés Reyes Guzmán  
+**Profesor Guía:** Gerardo Blanco Bogado  
+**Profesor Correferente:** Diego Altamirano Hernández  
+
+---
 ## Descripción
 
 Este repositorio implementa la arquitectura computacional híbrida desarrollada para modelar la adopción de vehículos eléctricos de batería (BEV) e híbridos enchufables (PHEV) en Chile bajo distintos escenarios de política pública, infraestructura de carga y fricción de mercado. El modelo integra dos módulos independientes:
